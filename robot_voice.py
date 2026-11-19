@@ -1,3 +1,6 @@
+# Author: Sarang R Sakhare
+# Date: 11/12/2026
+# Description: Takes voice sentences from user, detect the words and sentence, convert to text and then again converts to modulated robot voice.
 
 import queue
 import threading
