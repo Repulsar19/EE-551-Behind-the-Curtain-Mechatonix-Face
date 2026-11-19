@@ -15,3 +15,5 @@ Whisper Model download link : https://huggingface.co/openai/whisper-small.en
 
 For face_graphics.py:
 1. Must have pygame-ce installed
+
+After running the code, speak normally in microphone of device. it will detect the sentence and then repeat with modulated robot voice along with the face speaking animation.
