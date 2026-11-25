@@ -1,78 +1,51 @@
-# Author: Sarang R Sakhare
-# Date: 11/12/2026
-# Description: Takes voice sentences from user, detect the words and sentence, convert to text and then again converts to modulated robot voice.
-
-import queue
-import threading
-import numpy as np
-import sounddevice as sd
+import numpy as np, sounddevice as sd
 from faster_whisper import WhisperModel
 from piper import PiperVoice
 
-THRESHOLD = 0.02   # microphone sensitivity (lower = more sensitive)
-PAUSE_CHUNKS = 38  # silence that ends a sentence, in 32 ms chunks (38 = ~1.2 s)
-ROBOT_HZ = 60      # robot buzz: 30 = deep, 120 = buzzy
+THRESHOLD = 0.02   # mic sensitivity (lower = more sensitive)
+PAUSE = 25         # silence that ends a sentence, in 32 ms chunks (25 = 0.8 s)
+ROBOT_HZ = 30      # robot buzz: 30 = deep, 120 = buzzy
 
-whisper = WhisperModel("models/whisper-small.en", device="cpu", compute_type="int8")
+whisper = WhisperModel("models/whisper-small.en", device="cpu", compute_type="int8", cpu_threads=6)
 voice = PiperVoice.load("models/piper/en_US-ryan-medium.onnx")
-sentences = queue.Queue()
-robot_speaking = threading.Event()   # set while the robot is talking
-recent_words = set()                 # words the robot said recently (to ignore its own echo)
+RATE = voice.config.sample_rate
 
 
-def record_sentence(mic):
-    """Wait for you to talk, then record until you pause."""
-    recording = []
-    before = []        # last few chunks before talking started, so the first word is not cut
-    quiet = 0
-    while True:
-        chunk = mic.read(512)[0][:, 0]
-        limit = THRESHOLD * 5 if robot_speaking.is_set() else THRESHOLD   # less sensitive while robot talks
-        loud = np.abs(chunk).mean() > limit
-        if loud:
-            quiet = 0
-        elif recording:
-            quiet += 1
-        if loud or recording:
-            recording.append(chunk)
+def listen(mic):                               # Wait until you talk, record until you pause, return the sound
+
+    sound, quiet, talking = [], 0, False
+    while not talking or quiet < PAUSE:
+        chunk = mic.read(512)[0][:, 0]                                    # 32 ms of sound
+        sound.append(chunk)
+        if np.abs(chunk).mean() > THRESHOLD / (2 if talking else 1):     # loud? (quieter is ok once you started)
+            talking, quiet = True, 0
         else:
-            before = (before + [chunk])[-6:]                 
-        if quiet > PAUSE_CHUNKS:
-            if len(recording) - quiet < 10:                   
-                recording, quiet = [], 0
-                continue
-            audio = np.concatenate(before + recording)
-            return audio / max(np.abs(audio).max(), 0.01) * 0.9   # normalise volume for whisper
+            quiet += 1
+        if not talking:
+            sound = sound[-6:]                                            # not started yet: keep only the last 0.2 s
+    if len(sound) - quiet < 10:                                           # under 0.3 s = a click, not a word
+        return listen(mic)
+    sound = np.concatenate(sound)
+    return sound / max(np.abs(sound).max(), 0.01) * 0.9                   # normalise volume for whisper
 
 
-def robot():                            # background thread: text from speech, then speak it as a robot.
-    
-    global recent_words
-    while True:
-        audio = sentences.get()
-        segments, _ = whisper.transcribe(audio, language="en", beam_size=5, vad_filter=True)
-        text = " ".join(s.text for s in segments).strip()
-        words = set(w.strip(".,!?-").lower() for w in text.split())
-        if not words:
-            continue
-        if len(words & recent_words) / len(words) > 0.6:   # mostly the robot's own words = echo
-            print("(ignored echo:", text, ")")
-            continue
-        print("You said:", text)
-        speech = np.concatenate([c.audio_float_array for c in voice.synthesize(text)])
-        t = np.arange(len(speech)) / voice.config.sample_rate
-        speech = speech * (0.6 + 0.4 * np.sin(2 * np.pi * ROBOT_HZ * t))   # robot buzz
-        recent_words = words
-        robot_speaking.set()
-        sd.play(speech.astype(np.float32), voice.config.sample_rate, blocking=True)
-        robot_speaking.clear()
-
-
-threading.Thread(target=robot, daemon=True).start()
-print("Ready - talk, pause, and the robot repeats you. Ctrl+C to stop.")
 try:
     with sd.InputStream(samplerate=16000, channels=1, blocksize=512, dtype="float32") as mic:
         while True:
-            sentences.put(record_sentence(mic))
-except KeyboardInterrupt:
+            sound = listen(mic)
+            try:
+                segments, _ = whisper.transcribe(sound, language="en", beam_size=1)
+                text = " ".join(s.text for s in segments).strip()
+            except RuntimeError:                                          # PC is out of memory right now - skip it
+                print("(out of memory - sentence skipped)")
+                continue
+            if text:
+                print("You said:", text)
+                robot = np.concatenate([c.audio_float_array for c in voice.synthesize(text)])
+                robot *= 0.6 + 0.4 * np.sin(2 * np.pi * ROBOT_HZ * np.arange(len(robot)) / RATE)       # robot buzz
+                sd.play(np.append(robot, np.zeros(RATE // 4)).astype(np.float32), RATE, blocking=True)  # + 0.25 s tail
+            mic.read(mic.read_available)                                  # drop what the mic heard while the robot talked
+
+
+except KeyboardInterrupt:                         # Press Ctrl+C to stop the robot
     print("Bye.")
